@@ -81,3 +81,64 @@ def concurrent_conflict(number: str, revision: int,
         f"对规程 {number} r{revision} 的并发更正区间与既有更正 [{cs}, {ce}) 重叠，"
         f"同一版本的更正子区间不得相互冲突",
         http_status=409, details=details)
+
+
+def revision_not_found(number: str, revision: int,
+                       at_index: int | None = None) -> DomainError:
+    details = {"number": number, "revision": revision}
+    if at_index is not None:
+        details["index"] = at_index
+    return DomainError("revision_not_found",
+                       f"规程 {number} 的版本 r{revision} 不存在，无法撤回",
+                       http_status=404, details=details)
+
+
+def first_revision_not_withdrawable(number: str, revision: int,
+                                    at_index: int | None = None) -> DomainError:
+    details = {"number": number, "revision": revision}
+    if at_index is not None:
+        details["index"] = at_index
+    return DomainError(
+        "first_revision_not_withdrawable",
+        f"规程 {number} r{revision} 是首版，首版只能更正不能撤回",
+        http_status=409, details=details)
+
+
+def already_withdrawn(number: str, revision: int, withdrawn_at: str,
+                      at_index: int | None = None) -> DomainError:
+    details = {"number": number, "revision": revision,
+               "withdrawn_at": withdrawn_at}
+    if at_index is not None:
+        details["index"] = at_index
+    return DomainError(
+        "already_withdrawn",
+        f"规程 {number} r{revision} 已于 {withdrawn_at} 撤回，"
+        f"撤回只追加一次事件、不改变历史，不能重复撤回",
+        http_status=409, details=details)
+
+
+def version_has_children(number: str, revision: int,
+                         child_revisions: list[int],
+                         at_index: int | None = None) -> DomainError:
+    details = {"number": number, "revision": revision,
+               "child_revisions": child_revisions}
+    if at_index is not None:
+        details["index"] = at_index
+    return DomainError(
+        "version_has_children",
+        f"规程 {number} r{revision} 已存在子更正 r{child_revisions}，"
+        f"只能撤回当前仍生效且没有子更正的叶子版本（撤回不删除版本行）",
+        http_status=409, details=details)
+
+
+def base_version_withdrawn(number: str, revision: int, withdrawn_at: str,
+                           at_index: int | None = None) -> DomainError:
+    details = {"number": number, "revision": revision,
+               "withdrawn_at": withdrawn_at}
+    if at_index is not None:
+        details["index"] = at_index
+    return DomainError(
+        "base_version_withdrawn",
+        f"规程 {number} r{revision} 已于 {withdrawn_at} 撤回，"
+        f"不能以已撤回版本为被替代版本提交更正",
+        http_status=409, details=details)

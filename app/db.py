@@ -33,10 +33,22 @@ CREATE TABLE IF NOT EXISTS versions (
     UNIQUE(procedure_id, revision)
 );
 
+-- 撤回事件：只追加，不删除/改写 versions 行。
+-- 一个版本至多被撤回一次（UNIQUE）；撤回时刻 withdrawn_at 由服务端记录，不可回填。
+-- 双时间维语义：知悉时刻 k 下该版本可见当且仅当
+-- published_at <= k 且（未撤回 或 withdrawn_at > k）。
+CREATE TABLE IF NOT EXISTS withdrawals (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_id   INTEGER NOT NULL UNIQUE REFERENCES versions(id),
+    withdrawn_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_versions_procedure
     ON versions(procedure_id);
 CREATE INDEX IF NOT EXISTS idx_versions_query
     ON versions(published_at, valid_start, valid_end);
+CREATE INDEX IF NOT EXISTS idx_withdrawals_version
+    ON withdrawals(version_id);
 """
 
 _write_lock = threading.Lock()

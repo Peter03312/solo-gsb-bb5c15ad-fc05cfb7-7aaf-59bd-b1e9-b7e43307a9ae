@@ -110,3 +110,68 @@ curl -sS -i --get "$BASE_URL/api/v1/procedures/SOP-CURL-001/diff" \
   --data-urlencode 'known_after=2030-01-01T00:00:00Z' \
   --data-urlencode 'work_start=2026-03-01T00:00:00Z' \
   --data-urlencode 'work_end=2026-03-01T00:00:00Z'; echo
+
+# ------------------------------------------------------------------------
+# 撤回（本轮新增）：值班员发现更正误发布时，提交"规程编号 + 更正版本号"。
+# 撤回时刻 withdrawn_at 由服务端记录、不接受回填；撤回只追加事件、不删版本。
+# 前置数据：r1 为上面第 2 步发布的 3 月更正。
+# ------------------------------------------------------------------------
+
+# --- 10. 撤回误发布的更正 r1 --------------------------------------------
+# 成功 201，返回服务端记录的 withdrawn_at（与发布时间一样不可回填）
+curl -sS -X POST "$BASE_URL/api/v1/withdrawals" \
+  -H 'Content-Type: application/json' \
+  -d '{ "number": "SOP-CURL-001", "revision": 1 }'; echo
+
+# --- 11a. 撤回后回溯：3 月子区间恢复父版本 r0 正文 -----------------------
+curl -sS "$BASE_URL/api/v1/effective?work_time=2026-03-15T08:00:00Z"; echo
+
+# --- 11b. 撤回前知悉时刻的回溯仍按原版本链 -> 历史不变 -------------------
+# 知悉时刻取早于本轮服务运行的固定时刻：本脚本第 2 步的更正尚未发布，
+# 故 3 月返回父版本 r0（演示"撤回不改变撤回前查询"请把该参数改为
+# r1 发布之后、撤回之前的时刻，可从第 2/10 步响应中读取）。
+curl -sS "$BASE_URL/api/v1/effective?work_time=2026-03-15T08:00:00Z&known_as_of=2026-10-01T00:00:00Z"; echo
+
+# --- 11c. 历史审计：r1 行仍在，且带 withdrawn_at -------------------------
+curl -sS "$BASE_URL/api/v1/procedures/SOP-CURL-001/history"; echo
+
+# --- 12. 撤回后父版本可在恢复区间再次更正（新的 r2 指向 r0） -------------
+curl -sS -X POST "$BASE_URL/api/v1/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-CURL-001",
+        "base_revision": 0,
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end":   "2026-04-01T00:00:00Z",
+        "body": "更正正文（撤回误发版本后重新发布）：仍须穿戴防割手套。"
+      }'; echo
+
+# --- 13a. 重复撤回已撤回版本 -> 409 already_withdrawn（历史不变） --------
+curl -sS -i -X POST "$BASE_URL/api/v1/withdrawals" \
+  -H 'Content-Type: application/json' \
+  -d '{ "number": "SOP-CURL-001", "revision": 1 }'; echo
+
+# --- 13b. 撤回首版 -> 409 first_revision_not_withdrawable ---------------
+curl -sS -i -X POST "$BASE_URL/api/v1/withdrawals" \
+  -H 'Content-Type: application/json' \
+  -d '{ "number": "SOP-CURL-001", "revision": 0 }'; echo
+
+# --- 13c. 撤回不存在的版本号 -> 404 revision_not_found -------------------
+curl -sS -i -X POST "$BASE_URL/api/v1/withdrawals" \
+  -H 'Content-Type: application/json' \
+  -d '{ "number": "SOP-CURL-001", "revision": 99 }'; echo
+
+# --- 13d. 回填撤回时刻：withdrawn_at 为额外字段 -> 422 validation_error ---
+curl -sS -i -X POST "$BASE_URL/api/v1/withdrawals" \
+  -H 'Content-Type: application/json' \
+  -d '{ "number": "SOP-CURL-001", "revision": 2,
+        "withdrawn_at": "2000-01-01T00:00:00Z" }'; echo
+
+# --- 14. 批量撤回：整批原子，任一条非法全部不追加 -------------------------
+# 此处第二条撤首版非法，第一条（合法）也一并回滚
+curl -sS -i -X POST "$BASE_URL/api/v1/withdrawals" \
+  -H 'Content-Type: application/json' \
+  -d '{ "items": [
+        { "number": "SOP-CURL-001", "revision": 2 },
+        { "number": "SOP-CURL-001", "revision": 0 }
+      ]}'; echo

@@ -116,6 +116,97 @@ def main() -> None:
     # 9) 两知悉时刻作业区间对比（见文件下方 _diff_examples）
     _diff_examples(number, published_r1)
 
+    # 10) 撤回误发布的更正（本轮新增；独立规程演示，见 _withdrawal_examples）
+    _withdrawal_examples()
+
+
+def _withdrawal_examples() -> None:
+    """撤回示例：撤回只追加事件，撤回前历史不变，撤回后区间恢复父版本正文。"""
+    number = "SOP-DEMO-WD-001"
+
+    # 10.1) 发布首版 + 一条覆盖 3 月的更正
+    call("POST", "/api/v1/releases", {
+        "number": number,
+        "body": "初版正文：进入车间必须佩戴护目镜。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z",
+    })
+    published = call("POST", "/api/v1/corrections", {
+        "number": number,
+        "base_revision": 0,
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end": "2026-04-01T00:00:00Z",
+        "body": "误发布的更正正文。",
+    })[1]["items"][0]["published_at"]
+
+    # 10.2) 撤回 r1：只提交编号与更正版本号；withdrawn_at 由服务端记录
+    status, res = call("POST", "/api/v1/withdrawals",
+                       {"number": number, "revision": 1})
+    show("10.2 撤回误发布更正 r1（withdrawn_at 服务端记录）", status, res)
+    withdrawn_at = res["items"][0]["withdrawn_at"]
+
+    # 10.3) 撤回后回溯：3 月区间恢复父版本 r0 正文
+    status, res = call("GET",
+                       "/api/v1/effective?work_time=2026-03-15T08:00:00Z")
+    show("10.3 撤回后回溯（3 月恢复初版）", status,
+         [i for i in res["items"] if i["number"] == number])
+
+    # 10.4) 撤回前知悉时刻的回溯仍按原版本链 -> 仍是 r1（历史不变）
+    status, res = call(
+        "GET",
+        "/api/v1/effective?work_time=2026-03-15T08:00:00Z"
+        f"&known_as_of={published}")
+    show("10.4 以撤回前知悉时刻回溯（仍看到被撤回的 r1）", status,
+         [i for i in res["items"] if i["number"] == number])
+
+    # 10.5) 历史审计：r1 行仍在，且带 withdrawn_at
+    status, res = call("GET", f"/api/v1/procedures/{number}/history")
+    show("10.5 版本历史（r1 仍在并带 withdrawn_at）", status, res)
+
+    # 10.6) 撤回后父版本可在恢复的区间再次更正
+    status, res = call("POST", "/api/v1/corrections", {
+        "number": number,
+        "base_revision": 0,
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end": "2026-04-01T00:00:00Z",
+        "body": "重新发布的正确更正正文。",
+    })
+    show("10.6 在恢复区间以 r0 为基版再次更正（r2）", status, res)
+
+    # 10.7) 各类拒绝：重复撤回 / 撤首版 / 版本不存在 / 回填撤回时刻
+    status, res = call("POST", "/api/v1/withdrawals",
+                       {"number": number, "revision": 1})
+    show("10.7a 重复撤回 -> 409 already_withdrawn", status, res)
+    status, res = call("POST", "/api/v1/withdrawals",
+                       {"number": number, "revision": 0})
+    show("10.7b 撤回首版 -> 409 first_revision_not_withdrawable", status, res)
+    status, res = call("POST", "/api/v1/withdrawals",
+                       {"number": number, "revision": 99})
+    show("10.7c 版本号不存在 -> 404 revision_not_found", status, res)
+    status, res = call("POST", "/api/v1/withdrawals",
+                       {"number": number, "revision": 2,
+                        "withdrawn_at": "2000-01-01T00:00:00Z"})
+    show("10.7d 回填撤回时刻 -> 422 validation_error", status, res)
+
+    # 10.8) 两知悉时刻对比：撤回前一刻 vs 撤回后一刻，3 月段 r1 -> r0
+    import urllib.parse
+    from datetime import datetime, timedelta, timezone
+
+    def us_iso(canonical: str, delta_microseconds: int) -> str:
+        dt = datetime.strptime(canonical, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+            tzinfo=timezone.utc)
+        return (dt + timedelta(microseconds=delta_microseconds)).strftime(
+            "%Y-%m-%dT%H:%M:%S.%fZ")
+
+    q = urllib.parse.urlencode({
+        "known_before": published,                      # 撤回前：r1 可见
+        "known_after": us_iso(withdrawn_at, 1),         # 撤回后：恢复 r0
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end": "2027-01-01T00:00:00Z",
+    })
+    status, res = call("GET", f"/api/v1/procedures/{number}/diff?{q}")
+    show("10.8 撤回前后两知悉时刻对比（仅 3 月段 r1→r0）", status, res)
+
 
 def _diff_examples(number: str, published_r1: str) -> None:
     """对比接口示例：known_before / known_after 卡在 r1 发布时刻前后一微秒。"""
