@@ -37,6 +37,21 @@ CREATE INDEX IF NOT EXISTS idx_versions_procedure
     ON versions(procedure_id);
 CREATE INDEX IF NOT EXISTS idx_versions_query
     ON versions(published_at, valid_start, valid_end);
+
+-- 更正撤回事件：只追加、从不修改/删除 versions 行。
+-- withdrawn_at 为服务端记录的撤回时刻（不可回填）；一条更正至多一条撤回事件。
+-- 知悉时刻 >= withdrawn_at 的查询/对比视该更正为已失效，其适用子区间恢复父版本正文；
+-- 知悉时刻更早时仍按原版本链可见，撤回前的历史保持原样。
+CREATE TABLE IF NOT EXISTS correction_withdrawals (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    procedure_id  INTEGER NOT NULL REFERENCES procedures(id),
+    version_id    INTEGER NOT NULL REFERENCES versions(id) UNIQUE,
+    revision      INTEGER NOT NULL,
+    withdrawn_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_withdrawals_procedure
+    ON correction_withdrawals(procedure_id);
 """
 
 _write_lock = threading.Lock()

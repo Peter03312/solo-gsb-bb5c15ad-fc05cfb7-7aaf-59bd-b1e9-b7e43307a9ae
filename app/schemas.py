@@ -34,3 +34,12 @@ class CorrectionItem(StrictModel):
 
 class CorrectionBatch(StrictModel):
     items: list[CorrectionItem]
+
+
+class WithdrawalItem(StrictModel):
+    number: str = Field(..., description="规程编号")
+    revision: int = Field(..., ge=0, description="拟撤回的更正版本号（首版 0 不可撤回）")
+
+
+class WithdrawalBatch(StrictModel):
+    items: list[WithdrawalItem]

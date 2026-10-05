@@ -79,18 +79,89 @@ curl -sS -X POST "$BASE_URL/api/v1/corrections" \
          "body": "6 月更正（与上一条首尾相接，允许）"}
       ]}'; echo
 
-# --- 8. 版本历史（审计视图） --------------------------------------------
+# --- 8. 版本历史（审计视图，含已撤回版本与 withdrawn_at） ----------------
+curl -sS "$BASE_URL/api/v1/procedures/SOP-CURL-001/history"; echo
+
+# --- 10. 更正撤回（误发布撤回；withdrawn_at 由服务端记录，不可回填） -----
+# 注：第 7 步已用掉 r2（5 月）、r3（6 月），故此处的链式子更正为 r4。
+
+# 10a. 撤回首版 -> 409 revision_not_withdrawable / first_revision
+curl -sS -i -X POST "$BASE_URL/api/v1/corrections/withdrawals" \
+  -H 'Content-Type: application/json' \
+  -d '{"number": "SOP-CURL-001", "revision": 0}'; echo
+
+# 10b. 先给 3 月更正 r1 挂一个子更正（链式 r1 -> r4）
+curl -sS -X POST "$BASE_URL/api/v1/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-CURL-001",
+        "base_revision": 1,
+        "valid_start": "2026-03-10T00:00:00Z",
+        "valid_end":   "2026-03-20T00:00:00Z",
+        "body": "再更正：3 月 10-20 日改为全套防割装备。"
+      }'; echo
+
+# 10c. r1 已有子更正 r4 -> 409 revision_not_withdrawable / has_children
+curl -sS -i -X POST "$BASE_URL/api/v1/corrections/withdrawals" \
+  -H 'Content-Type: application/json' \
+  -d '{"number": "SOP-CURL-001", "revision": 1}'; echo
+
+# 10d. 批量撤回：先叶子 r4 再 r1，整批原子（服务端记录同一撤回时刻）
+curl -sS -X POST "$BASE_URL/api/v1/corrections/withdrawals" \
+  -H 'Content-Type: application/json' \
+  -d '{ "items": [
+        {"number": "SOP-CURL-001", "revision": 4},
+        {"number": "SOP-CURL-001", "revision": 1}
+      ]}'; echo
+
+# 10e. 重复撤回 r1 -> 409 revision_not_withdrawable / already_withdrawn
+curl -sS -i -X POST "$BASE_URL/api/v1/corrections/withdrawals" \
+  -H 'Content-Type: application/json' \
+  -d '{"number": "SOP-CURL-001", "revision": 1}'; echo
+
+# 10f. 撤回后 3 月子区间恢复父版本 r0 正文
+curl -sS "$BASE_URL/api/v1/effective?work_time=2026-03-15T08:00:00Z"; echo
+
+# 10g. 以已撤回的 r1 为基版更正 -> 409 base_version_withdrawn
+curl -sS -i -X POST "$BASE_URL/api/v1/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-CURL-001",
+        "base_revision": 1,
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end":   "2026-03-05T00:00:00Z",
+        "body": "基于已撤回版本，应被拒绝"
+      }'; echo
+
+# 10h. 回填撤回时刻：withdrawn_at 为额外字段 -> 422 validation_error
+curl -sS -i -X POST "$BASE_URL/api/v1/corrections/withdrawals" \
+  -H 'Content-Type: application/json' \
+  -d '{"number": "SOP-CURL-001", "revision": 1,
+       "withdrawn_at": "2000-01-01T00:00:00Z"}'; echo
+
+# 10i. 父版本 r0 在恢复区间上再次更正 -> 新版本号 r5（旧号不复用）
+curl -sS -X POST "$BASE_URL/api/v1/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-CURL-001",
+        "base_revision": 0,
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end":   "2026-04-01T00:00:00Z",
+        "body": "撤回后重新发布的 3 月更正：穿戴防割手套并双人监护。"
+      }'; echo
+
+# 10j. 历史视图：r1/r4 为 withdrawn 并带 withdrawn_at，r0/r2/r3/r5 为 active
 curl -sS "$BASE_URL/api/v1/procedures/SOP-CURL-001/history"; echo
 
 # --- 9a. 两知悉时刻对比：前侧取发布之前，作业区间覆盖全年 ---------------
-#       只有更正子区间（3 月）两侧版本不同；before 为 null（当时无任何版本）
+#       撤回并重发后，3 月子区间两侧为 null -> r5；5/6 月为 null -> r2/r3
 curl -sS --get "$BASE_URL/api/v1/procedures/SOP-CURL-001/diff" \
   --data-urlencode 'known_before=2025-01-01T00:00:00Z' \
   --data-urlencode 'known_after=2030-01-01T00:00:00Z' \
   --data-urlencode 'work_start=2026-01-01T00:00:00Z' \
   --data-urlencode 'work_end=2027-01-01T00:00:00Z'; echo
 
-# --- 9b. 收窄作业区间到 2-5 月：null→r0 与 null→r1 两段 -----------------
+# --- 9b. 收窄作业区间到 2-5 月：null->r0、null->r5（3月）、null->r2 段 ----
 curl -sS --get "$BASE_URL/api/v1/procedures/SOP-CURL-001/diff" \
   --data-urlencode 'known_before=2025-01-01T00:00:00Z' \
   --data-urlencode 'known_after=2030-01-01T00:00:00Z' \

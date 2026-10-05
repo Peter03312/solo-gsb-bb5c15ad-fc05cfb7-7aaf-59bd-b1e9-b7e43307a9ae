@@ -298,6 +298,233 @@ class CorrectionTests(unittest.TestCase):
         self.assertEqual(rows["C-2"]["body"], "另一个规程")
 
 
+def withdraw(number: str, revision: int):
+    return service.withdraw_corrections(
+        [SimpleNamespace(number=number, revision=revision)])
+
+
+def us_before(canonical: str, microseconds: int = 1) -> str:
+    dt = datetime.strptime(canonical, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+        tzinfo=timezone.utc)
+    return iso_us(dt - timedelta(microseconds=microseconds))
+
+
+class WithdrawalTests(unittest.TestCase):
+    """更正撤回：资格拒绝、只追加、双时间维可见性、恢复后再更正。"""
+
+    def setUp(self):
+        reset_db()
+        release("W-1", body="初版")
+        self.pub = correct("W-1", 0, t2, t3, "三月版")
+        self.published_at = self.pub["published_at"]
+
+    def test_withdraw_restores_parent_and_is_server_timed(self):
+        res = withdraw("W-1", 1)
+        wtime = res["withdrawn_at"]
+        self.assertTrue(wtime.endswith("Z"))
+        self.assertGreaterEqual(wtime, self.published_at)
+        item = res["items"][0]
+        self.assertEqual(item["revision"], 1)
+        self.assertEqual(item["supersedes_revision"], 0)
+        self.assertEqual(item["body"], "三月版")
+        self.assertEqual(item["withdrawn_at"], wtime)
+        # 撤回后该子区间恢复父版本正文；区间外原本就是父版本
+        self.assertEqual(numbers_at(t2, future)["W-1"]["body"], "初版")
+        self.assertEqual(numbers_at(
+            iso(_T + timedelta(days=29)), future)["W-1"]["body"], "初版")
+        self.assertEqual(numbers_at(t3, future)["W-1"]["body"], "初版")
+
+    def test_withdrawal_is_a_bitemporal_event(self):
+        wtime = withdraw("W-1", 1)["withdrawn_at"]
+        before = us_before(wtime)
+        # 知悉时刻早于撤回：原版本链不变，仍见更正正文
+        self.assertEqual(numbers_at(t2, before)["W-1"]["revision"], 1)
+        # 撤回时刻含等号：withdrawn_at <= known 即生效 -> 父版本
+        self.assertEqual(numbers_at(t2, wtime)["W-1"]["revision"], 0)
+
+    def test_history_shows_withdrawn_version_and_time(self):
+        wtime = withdraw("W-1", 1)["withdrawn_at"]
+        h = service.list_history("W-1")
+        self.assertEqual(h["count"], 2)               # 版本行未删除
+        by_rev = {v["revision"]: v for v in h["items"]}
+        self.assertEqual(by_rev[0]["status"], "active")
+        self.assertIsNone(by_rev[0]["withdrawn_at"])
+        self.assertEqual(by_rev[1]["status"], "withdrawn")
+        self.assertEqual(by_rev[1]["withdrawn_at"], wtime)
+        self.assertEqual(by_rev[1]["body"], "三月版")
+
+    def test_withdraw_first_revision_rejected(self):
+        with self.assertRaises(DomainError) as ctx:
+            withdraw("W-1", 0)
+        self.assertEqual(ctx.exception.code, "revision_not_withdrawable")
+        self.assertEqual(ctx.exception.http_status, 409)
+        self.assertEqual(ctx.exception.details["reason"], "first_revision")
+        self.assertEqual(ctx.exception.details["revision"], 0)
+        # 历史不变
+        self.assertEqual(service.list_history("W-1")["count"], 2)
+
+    def test_repeat_withdrawal_rejected(self):
+        wtime = withdraw("W-1", 1)["withdrawn_at"]
+        with self.assertRaises(DomainError) as ctx:
+            withdraw("W-1", 1)
+        self.assertEqual(ctx.exception.code, "revision_not_withdrawable")
+        self.assertEqual(ctx.exception.details["reason"], "already_withdrawn")
+        self.assertEqual(ctx.exception.details["withdrawn_at"], wtime)
+
+    def test_withdraw_version_with_children_rejected(self):
+        # r1 上再挂 r2（更正之更正）：r1 有子更正，不可撤回
+        correct("W-1", 1, t2, t3, "r2")
+        with self.assertRaises(DomainError) as ctx:
+            withdraw("W-1", 1)
+        self.assertEqual(ctx.exception.code, "revision_not_withdrawable")
+        self.assertEqual(ctx.exception.details["reason"], "has_children")
+        self.assertEqual(ctx.exception.details["child_revisions"], [2])
+        # 当前正文不受影响
+        self.assertEqual(numbers_at(t2, future)["W-1"]["revision"], 2)
+
+    def test_withdraw_chain_bottom_up_after_child_withdrawn(self):
+        # r2 是 r1 的子更正。生效中存在子更正时 r1 不能撤回；先撤回叶子 r2
+        # 后，r1 当前"尚无生效中子更正"，可以继续撤回（误发链自叶子向上）。
+        correct("W-1", 1, t2, t3, "r2")
+        with self.assertRaises(DomainError) as ctx:
+            withdraw("W-1", 1)
+        self.assertEqual(ctx.exception.code, "revision_not_withdrawable")
+        self.assertEqual(ctx.exception.details["reason"], "has_children")
+        self.assertEqual(numbers_at(t2, future)["W-1"]["revision"], 2)
+
+        withdraw("W-1", 2)
+        self.assertEqual(numbers_at(t2, future)["W-1"]["revision"], 1)
+        res = withdraw("W-1", 1)
+        self.assertEqual([x["revision"] for x in res["items"]], [1])
+        self.assertEqual(numbers_at(t2, future)["W-1"]["revision"], 0)
+        h = {v["revision"]: v for v
+             in service.list_history("W-1")["items"]}
+        self.assertEqual(h[1]["status"], "withdrawn")
+        self.assertEqual(h[2]["status"], "withdrawn")
+
+    def test_withdraw_chain_batch_must_be_leaf_first(self):
+        # 同批 [r1, r2] 顺序颠倒：处理 r1 时生效子更正 r2 尚在 -> 整批回滚
+        correct("W-1", 1, t2, t3, "r2")
+        with self.assertRaises(DomainError) as ctx:
+            service.withdraw_corrections([
+                SimpleNamespace(number="W-1", revision=1),
+                SimpleNamespace(number="W-1", revision=2),
+            ])
+        self.assertEqual(ctx.exception.code, "revision_not_withdrawable")
+        self.assertEqual(ctx.exception.details["reason"], "has_children")
+        self.assertEqual(ctx.exception.details["index"], 0)
+        self.assertEqual(numbers_at(t2, future)["W-1"]["revision"], 2)
+        # 叶子在前则整批成功
+        res = service.withdraw_corrections([
+            SimpleNamespace(number="W-1", revision=2),
+            SimpleNamespace(number="W-1", revision=1),
+        ])
+        self.assertEqual([x["revision"] for x in res["items"]], [2, 1])
+        self.assertEqual(numbers_at(t2, future)["W-1"]["revision"], 0)
+
+    def test_withdraw_missing_procedure_or_revision(self):
+        with self.assertRaises(DomainError) as ctx:
+            withdraw("NOPE", 1)
+        self.assertEqual(ctx.exception.code, "not_found")
+        self.assertEqual(ctx.exception.http_status, 404)
+        with self.assertRaises(DomainError) as ctx:
+            withdraw("W-1", 99)
+        self.assertEqual(ctx.exception.code, "base_version_not_found")
+        self.assertEqual(ctx.exception.http_status, 404)
+
+    def test_recorrect_on_restored_interval_keeps_revision_growing(self):
+        withdraw("W-1", 1)
+        # 不能以已撤回的 r1 为基版
+        with self.assertRaises(DomainError) as ctx:
+            correct("W-1", 1, t2, t3, "基于撤回版")
+        self.assertEqual(ctx.exception.code, "base_version_withdrawn")
+        self.assertEqual(ctx.exception.http_status, 409)
+        self.assertEqual(ctx.exception.details["revision"], 1)
+        # 父版本 r0 在恢复区间可再次更正；版本号递增、旧号 1 不复用
+        res = correct("W-1", 0, t2, t3, "三月修订二")
+        self.assertEqual(res["items"][0]["revision"], 2)
+        self.assertEqual(numbers_at(t2, future)["W-1"]["body"], "三月修订二")
+        # r1 仍为已撤回、r2 生效，三段历史都在
+        h = {v["revision"]: v for v in service.list_history("W-1")["items"]}
+        self.assertEqual(h[1]["status"], "withdrawn")
+        self.assertEqual(h[2]["status"], "active")
+        self.assertEqual(h[2]["supersedes_revision"], 0)
+
+    def test_withdrawal_boundary_is_inclusive(self):
+        wtime = withdraw("W-1", 1)["withdrawn_at"]
+        # withdrawn_at 前 1 微秒仍见 r1；撤回时刻本身见 r0
+        self.assertEqual(numbers_at(t2, us_before(wtime))["W-1"]["revision"], 1)
+        self.assertEqual(numbers_at(t2, wtime)["W-1"]["revision"], 0)
+
+    def test_batch_atomic_and_duplicate_target(self):
+        # 第一条撤回首版非法 -> 整批回滚（第二条即使是合法叶子 r1 也不撤回）
+        with self.assertRaises(DomainError) as ctx:
+            service.withdraw_corrections([
+                SimpleNamespace(number="W-1", revision=0),
+                SimpleNamespace(number="W-1", revision=1),
+            ])
+        self.assertEqual(ctx.exception.code, "revision_not_withdrawable")
+        self.assertEqual(ctx.exception.details["index"], 0)
+        self.assertEqual(numbers_at(t2, future)["W-1"]["revision"], 1)
+        # 同批次重复目标 -> 拒绝（index 指向重复条目）
+        with self.assertRaises(DomainError) as ctx:
+            service.withdraw_corrections([
+                SimpleNamespace(number="W-1", revision=1),
+                SimpleNamespace(number="W-1", revision=1),
+            ])
+        self.assertEqual(ctx.exception.code, "revision_not_withdrawable")
+        self.assertEqual(ctx.exception.details["index"], 1)
+        self.assertEqual(numbers_at(t2, future)["W-1"]["revision"], 1)
+        # 合法整批：先撤回 r1，再对恢复区间挂的新更正批量撤回
+        service.withdraw_corrections([SimpleNamespace(number="W-1", revision=1)])
+        correct("W-1", 0, t2, t3, "新三月")           # r2
+        res = service.withdraw_corrections(
+            [SimpleNamespace(number="W-1", revision=2)])
+        self.assertEqual([x["revision"] for x in res["items"]], [2])
+        self.assertEqual(numbers_at(t2, future)["W-1"]["revision"], 0)
+
+    def test_withdrawal_append_only_does_not_delete_rows(self):
+        before = service.list_history("W-1")
+        withdraw("W-1", 1)
+        # 撤回事件之外，versions 行正文/区间/发布时间完全保持
+        after = {v["revision"]: v for v
+                 in service.list_history("W-1")["items"]}
+        before_r1 = {v["revision"]: v for v in before["items"]}[1]
+        for key in ("body", "valid_start", "valid_end", "published_at",
+                    "supersedes_revision"):
+            self.assertEqual(after[1][key], before_r1[key])
+
+    def test_diff_across_withdrawal_shows_parent_then_can_change_again(self):
+        wtime = withdraw("W-1", 1)["withdrawn_at"]
+        # 仅跨撤回事件：r1 -> r0 一段
+        res = service.compare_interval("W-1", us_before(wtime), future, t1, t5)
+        self.assertEqual(res["count"], 1)
+        seg = res["segments"][0]
+        self.assertEqual((seg["start"], seg["end"]), (canon(t2), canon(t3)))
+        self.assertEqual(seg["before"]["revision"], 1)
+        self.assertEqual(seg["before"]["body"], "三月版")
+        self.assertEqual(seg["after"]["revision"], 0)
+        self.assertEqual(seg["after"]["body"], "初版")
+        # 撤回后再更正：同一区间 r0 -> r2，撤回前侧仍是 r1，共一段 r1 -> r2
+        correct("W-1", 0, t2, t3, "三月修订二")
+        res = service.compare_interval("W-1", us_before(wtime), future, t1, t5)
+        self.assertEqual(res["count"], 1)
+        seg = res["segments"][0]
+        self.assertEqual(seg["before"]["revision"], 1)
+        self.assertEqual(seg["after"]["revision"], 2)
+        self.assertEqual(seg["after"]["body"], "三月修订二")
+        # 两侧知悉时刻都在"更正已发布、撤回未发生"的窗口内：无变化
+        res = service.compare_interval(
+            "W-1", self.published_at, us_before(wtime), t1, t5)
+        self.assertEqual(res["count"], 0)
+
+    def test_diff_both_sides_after_withdrawal_no_false_change(self):
+        wtime = withdraw("W-1", 1)["withdrawn_at"]
+        later = iso(_T + timedelta(days=300))
+        res = service.compare_interval("W-1", wtime, later, t1, t5)
+        self.assertEqual(res["count"], 0)
+
+
 class CompareTests(unittest.TestCase):
     """两知悉时刻作业区间对比。"""
 
@@ -573,6 +800,103 @@ class ApiTests(unittest.TestCase):
         r = c.get(f"/api/v1/procedures/{n}/diff", params={
             "known_before": t0, "work_start": t1, "work_end": t5})
         self.assertEqual(r.status_code, 422)
+
+    def test_withdraw_over_http(self):
+        c = self.client
+        n = self._n()
+        c.post("/api/v1/releases", json={
+            "number": n, "body": "初版", "valid_start": t1, "valid_end": t5})
+        c.post("/api/v1/corrections", json={
+            "number": n, "base_revision": 0,
+            "valid_start": t2, "valid_end": t3, "body": "三月版"})
+
+        # 撤回首版 -> 409 revision_not_withdrawable/first_revision
+        r = c.post("/api/v1/corrections/withdrawals",
+                   json={"number": n, "revision": 0})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["error"]["code"],
+                         "revision_not_withdrawable")
+        self.assertEqual(r.json()["error"]["details"]["reason"],
+                         "first_revision")
+
+        # 合法撤回 r1
+        r = c.post("/api/v1/corrections/withdrawals",
+                   json={"number": n, "revision": 1})
+        self.assertEqual(r.status_code, 201)
+        body = r.json()
+        self.assertIn("withdrawn_at", body)
+        self.assertEqual(body["items"][0]["revision"], 1)
+        self.assertEqual(body["items"][0]["supersedes_revision"], 0)
+        wtime = body["withdrawn_at"]
+
+        # 重复撤回 -> 409 already_withdrawn
+        r = c.post("/api/v1/corrections/withdrawals",
+                   json={"number": n, "revision": 1})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["error"]["details"]["reason"],
+                         "already_withdrawn")
+
+        # 以撤回版本为基版 -> 409 base_version_withdrawn
+        r = c.post("/api/v1/corrections", json={
+            "number": n, "base_revision": 1,
+            "valid_start": t2, "valid_end": t3, "body": "x"})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["error"]["code"],
+                         "base_version_withdrawn")
+
+        # 恢复后可在父版本上再次更正
+        r = c.post("/api/v1/corrections", json={
+            "number": n, "base_revision": 0,
+            "valid_start": t2, "valid_end": t3, "body": "三月修订二"})
+        self.assertEqual(r.status_code, 201)
+        self.assertEqual(r.json()["items"][0]["revision"], 2)
+
+        # 回溯：当前（默认知悉时刻）见 r2；恰在撤回时刻 r2 尚未发布 -> 见父版 r0
+        r = c.get("/api/v1/effective", params={"work_time": t2})
+        found = [i for i in r.json()["items"] if i["number"] == n][0]
+        self.assertEqual(found["revision"], 2)
+        r = c.get("/api/v1/effective",
+                  params={"work_time": t2, "known_as_of": wtime})
+        found = [i for i in r.json()["items"] if i["number"] == n][0]
+        self.assertEqual(found["revision"], 0)
+
+        # 历史可见撤回版本与撤回时刻
+        r = c.get(f"/api/v1/procedures/{n}/history")
+        self.assertEqual(r.status_code, 200)
+        by_rev = {v["revision"]: v for v in r.json()["items"]}
+        self.assertEqual(by_rev[1]["status"], "withdrawn")
+        self.assertEqual(by_rev[1]["withdrawn_at"], wtime)
+        self.assertEqual(by_rev[0]["status"], "active")
+
+        # 编号不存在 -> 404；版本不存在 -> 404 base_version_not_found
+        r = c.post("/api/v1/corrections/withdrawals",
+                   json={"number": "NO-SUCH", "revision": 1})
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["error"]["code"], "not_found")
+        r = c.post("/api/v1/corrections/withdrawals",
+                   json={"number": n, "revision": 99})
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["error"]["code"],
+                         "base_version_not_found")
+
+        # 回填撤回时刻：额外字段 422 validation_error
+        r = c.post("/api/v1/corrections/withdrawals", json={
+            "number": n, "revision": 2,
+            "withdrawn_at": "2000-01-01T00:00:00Z"})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "validation_error")
+
+        # 批量：含非法条目整批回滚（r2 仍生效）
+        r = c.post("/api/v1/corrections/withdrawals", json={"items": [
+            {"number": n, "revision": 0},
+            {"number": n, "revision": 2},
+        ]})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["error"]["details"]["index"], 0)
+        r = c.get("/api/v1/effective",
+                  params={"work_time": t2, "known_as_of": future})
+        found = [i for i in r.json()["items"] if i["number"] == n][0]
+        self.assertEqual(found["revision"], 2)
 
     def test_health_and_empty_result(self):
         self.assertEqual(self.client.get("/health").json()["status"], "ok")

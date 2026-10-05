@@ -109,16 +109,96 @@ def main() -> None:
     })
     show("7. 链式更正 r1 -> r2", status, res)
 
+    # 8) 撤回误发布的更正（见文件下方 _withdrawal_examples）
+    _withdrawal_examples(number)
+
     status, res = call("GET",
                        "/api/v1/procedures/" + number + "/history")
-    show("8. 版本历史", status, res)
+    show("9. 版本历史（含已撤回版本与撤回时刻）", status, res)
 
-    # 9) 两知悉时刻作业区间对比（见文件下方 _diff_examples）
+    # 10) 两知悉时刻作业区间对比（见文件下方 _diff_examples）
     _diff_examples(number, published_r1)
 
 
+def _withdrawal_examples(number: str) -> None:
+    """撤回示例：资格拒绝 → 撤回 → 双时间维效果 → 恢复后再次更正。"""
+    # 8a) 撤回首版 -> 409 revision_not_withdrawable / first_revision
+    status, res = call("POST", "/api/v1/corrections/withdrawals",
+                       {"number": number, "revision": 0})
+    show("8a. 撤回首版被拒绝（first_revision，历史不变）", status, res)
+
+    # 8b) r1 已有子更正 r2（第 7 步），撤回 r1 -> 409 has_children
+    status, res = call("POST", "/api/v1/corrections/withdrawals",
+                       {"number": number, "revision": 1})
+    show("8b. 撤回有子更正的版本被拒绝（has_children）", status, res)
+
+    # 8c) 先撤回叶子 r2，再撤回 r1 —— 整批原子提交
+    status, res = call("POST", "/api/v1/corrections/withdrawals",
+                       {"items": [{"number": number, "revision": 2},
+                                  {"number": number, "revision": 1}]})
+    show("8c. 批量撤回 r2、r1（撤回时刻由服务端记录）", status, res)
+    r1_withdrawn = res["withdrawn_at"]
+
+    # 8d) 重复撤回 r1 -> 409 already_withdrawn
+    status, res = call("POST", "/api/v1/corrections/withdrawals",
+                       {"number": number, "revision": 1})
+    show("8d. 重复撤回被拒绝（already_withdrawn）", status, res)
+
+    # 8e) 撤回后 3 月子区间恢复父版本 r0 正文
+    status, res = call("GET",
+                       "/api/v1/effective?work_time=2026-03-15T08:00:00Z")
+    show("8e. 撤回后查询 3 月（恢复为父版本 r0 正文）", status, res)
+
+    # 8f) 撤回前知悉时刻的回溯仍按原版本链：取 r1 撤回时刻前 1 微秒查询
+    #     3 月 25 日（r2 只覆盖 3/10-3/20），此刻 r1 仍"已发布未撤回"，
+    #     看到的还是 r1 更正正文
+    import datetime as _dt
+    dt = _dt.datetime.strptime(r1_withdrawn, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+        tzinfo=_dt.timezone.utc)
+    just_before = (dt - _dt.timedelta(microseconds=1)).strftime(
+        "%Y-%m-%dT%H:%M:%S.%fZ")
+    status, res = call("GET",
+                       "/api/v1/effective?work_time=2026-03-25T08:00:00Z"
+                       "&known_as_of=" + just_before)
+    show("8f. 撤回前 1 微秒的回溯（原版本链，仍见 r1 更正正文）", status, res)
+
+    # 8g) 以已撤回的 r1 为基版 -> 409 base_version_withdrawn
+    status, res = call("POST", "/api/v1/corrections", {
+        "number": number,
+        "base_revision": 1,
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end": "2026-03-05T00:00:00Z",
+        "body": "试图基于已撤回版本，必须被拒绝。",
+    })
+    show("8g. 以已撤回版本为基版被拒绝（base_version_withdrawn）", status, res)
+
+    # 8h) 回填撤回时刻：额外字段 -> 422 validation_error
+    status, res = call("POST", "/api/v1/corrections/withdrawals", {
+        "number": number, "revision": 1,
+        "withdrawn_at": "2000-01-01T00:00:00Z"})
+    show("8h. 回填撤回时刻被拒绝（422 validation_error）", status, res)
+
+    # 8i) 父版本在恢复的区间上可再次更正：新版本号 r3（旧号不复用）
+    status, res = call("POST", "/api/v1/corrections", {
+        "number": number,
+        "base_revision": 0,
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end": "2026-04-01T00:00:00Z",
+        "body": "撤回后重新发布的 3 月更正：穿戴防割手套并双人监护。",
+    })
+    show("8i. 恢复区间上以 r0 为基版再次更正（新版本号 r3）", status, res)
+    status, res = call("GET",
+                       "/api/v1/effective?work_time=2026-03-15T08:00:00Z")
+    show("8j. 再次更正后查询 3 月（当前正文为 r3）", status, res)
+
+
 def _diff_examples(number: str, published_r1: str) -> None:
-    """对比接口示例：known_before / known_after 卡在 r1 发布时刻前后一微秒。"""
+    """对比接口示例。
+
+    走到这里时版本状态为：r1、r2 已撤回，r3 是撤回后在 3 月区间重新发布的
+    更正（基于 r0）。以"撤回前 / 很久以后"两个知悉时刻对比，3 月段呈现
+    r1 → r3；另演示只跨撤回事件时的 r1 → 父版本 r0 片段。
+    """
     import urllib.parse
     from datetime import datetime, timedelta, timezone
 
@@ -128,19 +208,36 @@ def _diff_examples(number: str, published_r1: str) -> None:
         return (dt + timedelta(microseconds=delta_microseconds)).strftime(
             "%Y-%m-%dT%H:%M:%S.%fZ")
 
-    # 9a) 全年作业区间：只有 3 月这一段在两侧分别是 r0 / r1；
-    #     两侧同为 r0 的相邻部分不返回
+    # 取 r1 的发布/撤回时刻（均由服务端记录）
+    _, hist = call("GET", "/api/v1/procedures/" + number + "/history")
+    by_rev = {v["revision"]: v for v in hist["items"]}
+    pub1 = by_rev[1]["published_at"]
+    wd1 = by_rev[1]["withdrawn_at"]
+
+    # 9a) 前侧卡在 r1 已发布、撤回之前；后侧取很久以后（r1/r2 已撤回、
+    #     r3 生效）：全年区间只有 3 月段两侧不同，为 r1 -> r3
     q = urllib.parse.urlencode({
-        "known_before": us_iso(published_r1, -1),
-        "known_after": us_iso(published_r1, 1),
+        "known_before": us_iso(pub1, 1),
+        "known_after": us_iso(pub1, 10_000_000),
         "work_start": "2026-01-01T00:00:00Z",
         "work_end": "2027-01-01T00:00:00Z",
     })
     status, res = call("GET", f"/api/v1/procedures/{number}/diff?{q}")
-    show("9a. 两知悉时刻对比（全年区间，仅 3 月段 r0→r1）", status, res)
+    show("9a. 两知悉时刻对比（撤回前 r1 → 撤回并重发后 r3，仅 3 月段）",
+         status, res)
 
-    # 9b) 前侧取很早以前（一切版本均未发布）：before=null 逐段列出。
-    #     作业区间只问 2-5 月，其中 r1 还被第 7 步的 r2 切成 r1/r2/r1 三段
+    # 9b) 只跨 r1 撤回事件（撤回前 1 微秒 -> 撤回时刻本身）：r1 -> 父版本 r0
+    q = urllib.parse.urlencode({
+        "known_before": us_iso(wd1, -1),
+        "known_after": wd1,
+        "work_start": "2026-02-01T00:00:00Z",
+        "work_end": "2026-05-01T00:00:00Z",
+    })
+    status, res = call("GET", f"/api/v1/procedures/{number}/diff?{q}")
+    show("9b. 只跨撤回事件（3 月段 r1 → 恢复父版本 r0）", status, res)
+
+    # 9c) 前侧取很早以前（一切版本均未发布）：before=null 逐段列出，
+    #     3 月段后侧为撤回后重发的 r3
     q = urllib.parse.urlencode({
         "known_before": "2025-01-01T00:00:00Z",
         "known_after": "2030-01-01T00:00:00Z",
@@ -148,9 +245,9 @@ def _diff_examples(number: str, published_r1: str) -> None:
         "work_end": "2026-05-01T00:00:00Z",
     })
     status, res = call("GET", f"/api/v1/procedures/{number}/diff?{q}")
-    show("9b. 前侧无任何可见版本（before 为 null 也逐段列出）", status, res)
+    show("9c. 前侧无任何可见版本（before 为 null 也逐段列出）", status, res)
 
-    # 9c) 知悉顺序颠倒 -> 422 invalid_known_order，不写历史
+    # 9d) 知悉顺序颠倒 -> 422 invalid_known_order，不写历史
     q = urllib.parse.urlencode({
         "known_before": "2030-01-01T00:00:00Z",
         "known_after": "2025-01-01T00:00:00Z",
@@ -158,7 +255,7 @@ def _diff_examples(number: str, published_r1: str) -> None:
         "work_end": "2027-01-01T00:00:00Z",
     })
     status, res = call("GET", f"/api/v1/procedures/{number}/diff?{q}")
-    show("9c. 知悉顺序颠倒被拒绝", status, res)
+    show("9d. 知悉顺序颠倒被拒绝", status, res)
 
 
 if __name__ == "__main__":

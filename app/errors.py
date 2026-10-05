@@ -81,3 +81,41 @@ def concurrent_conflict(number: str, revision: int,
         f"对规程 {number} r{revision} 的并发更正区间与既有更正 [{cs}, {ce}) 重叠，"
         f"同一版本的更正子区间不得相互冲突",
         http_status=409, details=details)
+
+
+def revision_not_withdrawable(number: str, revision: int, reason: str,
+                              at_index: int | None = None,
+                              withdrawn_at: str | None = None,
+                              child_revisions: list[int] | None = None
+                              ) -> DomainError:
+    """目标版本不允许撤回：首版 / 已有子更正 / 已撤回。整体拒绝、不改历史。"""
+    details = {"number": number, "revision": revision, "reason": reason}
+    if at_index is not None:
+        details["index"] = at_index
+    if reason == "first_revision":
+        msg = (f"规程 {number} r{revision} 是首版，首版只能被更正、不能撤回")
+    elif reason == "has_children":
+        details["child_revisions"] = child_revisions or []
+        msg = (f"规程 {number} r{revision} 已存在子更正"
+               f"（revision {details['child_revisions']}），"
+               f"须先撤回其全部子更正后才能撤回该版本")
+    else:  # already_withdrawn
+        details["withdrawn_at"] = withdrawn_at
+        msg = (f"规程 {number} r{revision} 已在 {withdrawn_at} 撤回，"
+               f"撤回不可重复（历史不改变）")
+    return DomainError("revision_not_withdrawable", msg,
+                       http_status=409, details=details)
+
+
+def base_version_withdrawn(number: str, revision: int, withdrawn_at: str,
+                           at_index: int | None = None) -> DomainError:
+    """以已撤回的更正版本作为被替代版本：拒绝，提示改以父版本为基版。"""
+    details = {"number": number, "revision": revision,
+               "withdrawn_at": withdrawn_at}
+    if at_index is not None:
+        details["index"] = at_index
+    return DomainError(
+        "base_version_withdrawn",
+        f"规程 {number} r{revision} 已于 {withdrawn_at} 撤回，"
+        f"不能再以其为被替代版本；该区间已恢复父版本正文，请改以父版本为基版",
+        http_status=409, details=details)

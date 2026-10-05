@@ -10,7 +10,8 @@ from . import service
 from .config import settings
 from .db import init_db
 from .errors import DomainError
-from .schemas import CorrectionBatch, CorrectionItem, ReleaseBatch, ReleaseItem
+from .schemas import (CorrectionBatch, CorrectionItem, ReleaseBatch,
+                      ReleaseItem, WithdrawalBatch, WithdrawalItem)
 
 app = FastAPI(
     title="安全作业规程历史回溯服务",
@@ -56,6 +57,7 @@ def index() -> dict:
             "endpoints": [
                 "POST /api/v1/releases",
                 "POST /api/v1/corrections",
+                "POST /api/v1/corrections/withdrawals",
                 "GET  /api/v1/effective",
                 "GET  /api/v1/procedures/{number}/history",
                 "GET  /api/v1/procedures/{number}/diff",
@@ -90,6 +92,19 @@ async def create_correction(request: Request) -> dict:
     payload = await request.json()
     items = _coerce_items(payload, CorrectionItem, CorrectionBatch)
     return service.submit_corrections(items)
+
+
+@app.post("/api/v1/corrections/withdrawals", status_code=201)
+async def withdraw_correction(request: Request) -> dict:
+    """撤回误发布的更正：凭规程编号 + 更正版本号。
+
+    撤回时刻由服务端记录、不可回填；只追加撤回事件，不删除原版本。仅当前仍
+    生效、尚无子更正的更正版本可撤回；首版、已撤回版本、已有子更正的版本一律
+    拒绝且不改变历史。支持单条对象或 {"items": [...]} 批量（整批原子）。
+    """
+    payload = await request.json()
+    items = _coerce_items(payload, WithdrawalItem, WithdrawalBatch)
+    return service.withdraw_corrections(items)
 
 
 @app.get("/api/v1/effective")

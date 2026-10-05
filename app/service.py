@@ -10,11 +10,28 @@
 更正只新增行（子版本），不修改任何旧行，因此"更正发布前的查询结果"天然保持原样：
 查询时以知悉时刻 ``known_as_of`` 过滤 ``published_at <= known_as_of`` 即可。
 
+撤回
+----
+发现更正误发布时，值班员可凭"规程编号 + 更正版本号"撤回。撤回同样是**只追加事件**
+（``correction_withdrawals`` 行），撤回时刻 ``withdrawn_at`` 由服务端时钟记录、不可
+回填，原 versions 行永不删除/修改：
+
+* 仅"当前仍生效且尚无子更正"的更正版本可撤回（子更正指**生效中**、尚未撤回的
+  直接子版本）：首版、已有生效中子更正、已撤回版本一律拒绝且不改变历史；
+* 子更正一旦撤回即不再占位：误发的更正链可自叶子向上逐级撤回；撤回批次按条目
+  顺序处理，同一批中须把子版本排在前面；
+* 撤回对知悉时刻 ``>= withdrawn_at`` 的查询/对比生效：该更正在其适用子区间失效，
+  区间恢复父版本正文，父版本可在恢复的区间上再次更正（新版本号继续递增、旧号不复用）；
+* 知悉时刻 ``< withdrawn_at`` 时撤回事件尚不可见，回溯与区间对比仍按原版本链还原；
+* 所有写操作共用同一把写锁，撤回与并发更正在单事务内按服务端事件先后确定性
+  串行：先撤回则基于它的更正被拒（基版已失效），先更正则它有了生效子更正、
+  撤回被拒，同一区间任何时刻至多一份当前正文。
+
 版本树
 ------
 - 首版：``revision=0``、``supersedes_id IS NULL``；
 - 更正：指向被替代版本 ``supersedes_id``，编号为该规程下递增的 revision；
-- 父版本的"仍生效区间" = 自身区间 − 其全部子更正区间（同父更正区间两两不重叠）；
+- 父版本的"仍生效区间" = 自身区间 − 其全部**未撤回**子更正区间（同父更正区间两两不重叠）；
 - 查询时在所有可见候选中沿 supersedes 链取"最深"版本，即为作业时刻有效正文。
 """
 from __future__ import annotations
@@ -140,14 +157,33 @@ def _fetch_version(conn: sqlite3.Connection, proc_id: int,
 
 def _children(conn: sqlite3.Connection,
               version_id: int) -> list[sqlite3.Row]:
+    """直接以该版本为被替代版本、且**当前生效中**（未撤回）的子更正。
+
+    撤回后的子更正不再占位：父版本的"仍生效区间"因此恢复，撤回资格中的
+    "尚无子更正"也以本函数为准——误发的更正链撤回子版本后可继续撤回父版本。
+    按适用起点排序。
+    """
     return conn.execute(
-        "SELECT * FROM versions WHERE supersedes_id = ? ORDER BY valid_start",
+        """
+        SELECT v.* FROM versions v
+         WHERE v.supersedes_id = ?
+           AND NOT EXISTS (SELECT 1 FROM correction_withdrawals w
+                            WHERE w.version_id = v.id)
+         ORDER BY v.valid_start
+        """,
         (version_id,)).fetchall()
+
+
+def _withdrawal(conn: sqlite3.Connection,
+                version_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM correction_withdrawals WHERE version_id = ?",
+        (version_id,)).fetchone()
 
 
 def _remaining(conn: sqlite3.Connection,
                base: sqlite3.Row) -> list[tuple[str, str]]:
-    """基版在其当前生效区间内尚未被子更正覆盖的子区间集合。"""
+    """基版在其当前生效区间内尚未被**未撤回**子更正覆盖的子区间集合。"""
     holes = [(c["valid_start"], c["valid_end"])
              for c in _children(conn, base["id"])]
     return _subtract_intervals((base["valid_start"], base["valid_end"]), holes)
@@ -226,7 +262,14 @@ def submit_corrections(items: list) -> dict:
                     f"r{item.base_revision} 的适用区间 [{base_iv[0]}, {base_iv[1]})",
                     i)
 
-            # 2) 同一被替代版本的并发更正不得在生效区间上相互冲突。
+            # 2) 基版本体已撤回 -> 该区间已恢复父版本正文，不能再据其更正。
+            #    撤回是已提交事件，优先于本批次内的并发冲突仲裁。
+            withdrawn = _withdrawal(conn, base["id"])
+            if withdrawn is not None:
+                raise errors.base_version_withdrawn(
+                    number, item.base_revision, withdrawn["withdrawn_at"], i)
+
+            # 3) 同一被替代版本的并发更正不得在生效区间上相互冲突。
             #    先于"剩余区间"检查：同批次更早条目虽已插入当前事务、
             #    尚非已发布历史，对它们的重叠属于并发更正，而非过期基版。
             key = (proc_id, item.base_revision)
@@ -235,9 +278,9 @@ def submit_corrections(items: list) -> dict:
                 raise errors.concurrent_conflict(number, item.base_revision,
                                                  clash, i)
 
-            # 3) 扣除已发布子更正后的剩余生效区间；子区间不落在其中 -> 过期基版。
+            # 4) 扣除未撤回子更正后的剩余生效区间；子区间不落在其中 -> 过期基版。
             #    （步骤 1 已保证子区间在基版区间内，故未被剩余区间覆盖的部分
-            #    必然与某个已发布子更正重叠，即客户依据的是已被替代的旧版。）
+            #    必然与某个生效子更正重叠，即客户依据的是已被替代的旧版。）
             remaining = _remaining(conn, base)
             if not _covered_by(sub, remaining):
                 raise errors.expired_base(number, item.base_revision, remaining, i)
@@ -261,11 +304,91 @@ def submit_corrections(items: list) -> dict:
 
     return {"published_at": published_at, "items": created}
 
+# ---------------------------------------------------------------- 更正撤回
+
+
+def withdraw_corrections(items: list) -> dict:
+    """撤回一条或多条误发布的更正；任一条目不合法则整批回滚。
+
+    撤回只向 correction_withdrawals 追加事件，撤回时刻由服务端记录、不接受回填，
+    原版本行不删除、不修改。资格规则（任一不满足即整体拒绝、历史不变）：
+
+    * 规程/版本须存在；
+    * 首版（revision=0）不可撤回；
+    * 尚有**生效中**直接子更正的版本不可撤回（子更正撤回后即不再占位）；
+    * 已撤回的版本不可重复撤回。
+
+    同批次内重复提交同一 (number, revision) 视为重复撤回，整批拒绝。撤回批次按
+    条目顺序处理：撤回"父版本"前其生效中子版本须已撤回——同一批中把子版本
+    条目排在前面即可（误发更正链自叶子向上撤回）。
+    """
+    normalized: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
+    for i, item in enumerate(items):
+        number = _clean_number(item.number, i)
+        if (number, item.revision) in seen:
+            raise errors.revision_not_withdrawable(
+                number, item.revision, "already_withdrawn", i)
+        seen.add((number, item.revision))
+        normalized.append((number, item.revision))
+
+    with write_tx() as conn:
+        withdrawn_at = _server_now()
+        created: list[dict] = []
+        for i, (number, revision) in enumerate(normalized):
+            proc = _fetch_procedure(conn, number)
+            if proc is None:
+                raise errors.procedure_not_found(number, i)
+            proc_id = proc["id"]
+            version = _fetch_version(conn, proc_id, revision)
+            if version is None:
+                raise errors.base_version_not_found(number, revision, i)
+
+            if revision == 0 or version["supersedes_id"] is None:
+                raise errors.revision_not_withdrawable(
+                    number, revision, "first_revision", i)
+
+            # "尚无子更正"按当前生效状态判定：只看生效中的直接子更正；
+            # 子更正若也已撤回便不再占位，误发链可自叶子向上逐级撤回。
+            kids = _children(conn, version["id"])
+            if kids:
+                raise errors.revision_not_withdrawable(
+                    number, revision, "has_children", i,
+                    child_revisions=[c["revision"] for c in kids])
+
+            prior = _withdrawal(conn, version["id"])
+            if prior is not None:
+                raise errors.revision_not_withdrawable(
+                    number, revision, "already_withdrawn", i,
+                    withdrawn_at=prior["withdrawn_at"])
+
+            conn.execute(
+                "INSERT INTO correction_withdrawals "
+                "(procedure_id, version_id, revision, withdrawn_at) "
+                "VALUES (?, ?, ?, ?)",
+                (proc_id, version["id"], revision, withdrawn_at))
+
+            parent = conn.execute(
+                "SELECT revision FROM versions WHERE id = ?",
+                (version["supersedes_id"],)).fetchone()
+            created.append({
+                "number": number,
+                "revision": revision,
+                "supersedes_revision": parent["revision"] if parent else None,
+                "valid_start": version["valid_start"],
+                "valid_end": version["valid_end"],
+                "body": version["body"],
+                "withdrawn_at": withdrawn_at,
+            })
+
+    return {"withdrawn_at": withdrawn_at, "items": created}
+
 # ---------------------------------------------------------------- 回溯查询
 
 
 def _serialize(row: sqlite3.Row,
                parent_rev: dict[int, int]) -> dict:
+    """回溯查询用的版本序列化：维持既有字段集合不变（撤回不新增响应字段）。"""
     pid = row["supersedes_id"]
     return {
         "number": row["number"],
@@ -276,6 +399,17 @@ def _serialize(row: sqlite3.Row,
         "supersedes_revision": parent_rev.get(pid) if pid is not None else None,
         "published_at": row["published_at"],
     }
+
+
+def _serialize_history(row: sqlite3.Row,
+                       parent_rev: dict[int, int],
+                       withdrawn_at_by_version: dict[int, str]) -> dict:
+    """审计视图序列化：额外带 status(active/withdrawn) 与 withdrawn_at。"""
+    item = _serialize(row, parent_rev)
+    withdrawn_at = withdrawn_at_by_version.get(row["id"])
+    item["status"] = "withdrawn" if withdrawn_at is not None else "active"
+    item["withdrawn_at"] = withdrawn_at
+    return item
 
 
 def _depth_of(version_id: int, by_id: dict[int, sqlite3.Row],
@@ -289,6 +423,11 @@ def _depth_of(version_id: int, by_id: dict[int, sqlite3.Row],
     while cur_id is not None and cur_id not in depth_cache:
         chain.append(cur_id)
         parent = by_id[cur_id]["supersedes_id"]
+        if parent is not None and parent not in by_id:
+            # 防御：可见候选的父版本在该知悉时刻已撤回（正常数据不会出现——
+            # 有子更正的版本不可撤回，且撤回版本不可能有子更正）。
+            cur_id = None
+            break
         cur_id = parent if parent is not None else None
     base = depth_cache[cur_id] if cur_id is not None else 0
     for vid in reversed(chain):
@@ -320,9 +459,21 @@ def _effective_at(t: str, candidates: list[sqlite3.Row],
 
 def _visible_versions(conn: sqlite3.Connection, proc_id: int,
                       known_as_of: str) -> list[sqlite3.Row]:
+    """截至知悉时刻可见的版本：已发布且未在该时刻（含）之前撤回。
+
+    撤回事件只在 ``withdrawn_at <= known_as_of`` 时生效；更早的知悉时刻仍能
+    看到被撤回版本，故撤回前的回溯保持原版本链不变。
+    """
     return conn.execute(
-        "SELECT * FROM versions WHERE procedure_id = ? AND published_at <= ?",
-        (proc_id, known_as_of)).fetchall()
+        """
+        SELECT v.* FROM versions v
+         WHERE v.procedure_id = ?
+           AND v.published_at <= ?
+           AND NOT EXISTS (
+               SELECT 1 FROM correction_withdrawals w
+                WHERE w.version_id = v.id AND w.withdrawn_at <= ?)
+        """,
+        (proc_id, known_as_of, known_as_of)).fetchall()
 
 
 def query_effective(work_time_raw: str, known_as_of_raw: str | None) -> dict:
@@ -349,9 +500,12 @@ def query_effective(work_time_raw: str, known_as_of_raw: str | None) -> dict:
              WHERE v.published_at <= ?
                AND v.valid_start <= ?
                AND ? < v.valid_end
+               AND NOT EXISTS (
+                   SELECT 1 FROM correction_withdrawals w
+                    WHERE w.version_id = v.id AND w.withdrawn_at <= ?)
              ORDER BY p.number
             """,
-            (known_as_of, work_time, work_time)).fetchall()
+            (known_as_of, work_time, work_time, known_as_of)).fetchall()
         if not rows:
             return {"work_time": work_time, "known_as_of": known_as_of,
                     "count": 0, "items": []}
@@ -416,7 +570,12 @@ def list_history(number_raw: str) -> dict:
                         f"SELECT id, revision FROM versions WHERE id IN ({placeholders})",
                         ids):
                     parent_rev[prow["id"]] = prow["revision"]
-        items = [_serialize(r, parent_rev) for r in rows]
+        # 撤回事件是审计视图的一部分：已撤回版本仍在历史中，另带 withdrawn_at。
+        withdrawn_at: dict[int, str] = {}
+        for wrow in conn.execute(
+                "SELECT version_id, withdrawn_at FROM correction_withdrawals"):
+            withdrawn_at[wrow["version_id"]] = wrow["withdrawn_at"]
+        items = [_serialize_history(r, parent_rev, withdrawn_at) for r in rows]
     return {"number": number, "count": len(items), "items": items}
 
 
@@ -444,9 +603,11 @@ def compare_interval(number_raw: str,
     """比较同一规程在先后两个知悉时刻、对作业区间 [work_start, work_end) 的
     实际适用内容，逐段返回两侧可见版本不同的最大片段。
 
-    各侧状态按发布时间（published_at <= 知悉时刻）沿更正链还原：
-    覆盖同一作业时刻的候选版本中，链上最深者为该时刻的有效版本；
-    无任何可见版本覆盖时该侧记为空（revision/body 均为 null）。
+    各侧状态沿版本链按事件时刻还原：仅纳入 ``published_at <= 知悉时刻`` 的版本，
+    并剔除 ``withdrawn_at <= 知悉时刻`` 的已撤回更正；覆盖同一作业时刻的候选
+    版本中，链上最深者为该时刻的有效版本；无任何可见版本覆盖时该侧记为空
+    （revision/body 均为 null）。因此撤回前后两侧会呈现"父正文 → 更正正文 →
+    父正文"或反向的变化片段。
     """
     # 入参全部校验通过后再查库；任何非法输入均只读、不写历史。
     number = number_raw.strip()
